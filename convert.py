@@ -12,18 +12,17 @@
 # ]
 # ///
 """
-md_to_pdf_docx — one-shot converter
+md_to_pdf_docx — one-shot converter (clean A4 layout)
 
-Reads a single Markdown file (the kind produced by `system_prompt.md`),
-renders every ```mermaid``` block to a PNG via mermaid.ink (with a local
-mmdc fallback), guarantees every diagram fits the A4 content area, then
-emits BOTH a PDF and a DOCX in one run.
-
-Usage:
-    uv run convert.py documentation.md
-    uv run convert.py documentation.md --out build
-    uv run convert.py documentation.md --pdf-only
-    uv run convert.py documentation.md --docx-only
+What this build adds vs the previous version:
+- A real cover page parsed from the Markdown (# Title + > subtitle).
+- A dedicated Table of Contents page that auto-builds from ##/### headings.
+- Every level-2 section ("## N. ...") starts on a NEW page.
+- Diagrams + their caption are kept on the same page; oversized diagrams shrink
+  to fit the remaining page real-estate (-pdf-keep-in-frame-mode: shrink).
+- Subsections (### N.M ...) use a thin blue accent bar.
+- Tables, lists, and code blocks avoid mid-row / mid-block page breaks.
+- Page footer with "Page X of Y" on every page.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-# Force UTF-8 stdout/stderr on Windows so arrows and box glyphs don't crash.
+# Force UTF-8 stdout/stderr on Windows.
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -51,11 +50,9 @@ import requests
 from PIL import Image
 
 # ---------- A4 geometry --------------------------------------------------
-# A4 = 210 x 297 mm. Margins 20 mm each side -> content = 170 x 257 mm.
-# At 96 dpi: 1 mm = 3.7795 px. So content ~= 642 x 971 px.
 A4_CONTENT_WIDTH_MM = 170
-A4_CONTENT_HEIGHT_MM = 257
-DPI = 150  # render diagrams at 150 dpi for crisp PDF
+A4_CONTENT_HEIGHT_MM = 250
+DPI = 150
 PX_PER_MM = DPI / 25.4
 MAX_DIAGRAM_W_PX = int(A4_CONTENT_WIDTH_MM * PX_PER_MM)
 MAX_DIAGRAM_H_PX = int(A4_CONTENT_HEIGHT_MM * PX_PER_MM)
@@ -75,7 +72,6 @@ class Diagram:
 # ---------- Mermaid rendering -------------------------------------------
 
 def _pako_encode(text: str) -> str:
-    """Encode mermaid source the way mermaid.ink expects (pako/zlib + base64url)."""
     payload = (
         '{"code":' + _json_str(text) + ',"mermaid":{"theme":"default"}}'
     ).encode("utf-8")
@@ -85,7 +81,6 @@ def _pako_encode(text: str) -> str:
 
 
 def _json_str(s: str) -> str:
-    """Inline JSON-string escape (avoid importing json just for this)."""
     import json
     return json.dumps(s)
 
@@ -106,36 +101,39 @@ def _render_via_mermaid_ink(code: str, out_png: Path) -> bool:
 
 
 def _render_via_mmdc(code: str, out_png: Path) -> bool:
-    if not shutil.which("mmdc"):
+    mmdc = shutil.which("mmdc") or shutil.which("mmdc.cmd") or shutil.which("mmdc.exe")
+    if not mmdc:
         return False
     src = out_png.with_suffix(".mmd")
     src.write_text(code, encoding="utf-8")
     try:
         subprocess.run(
-            ["mmdc", "-i", str(src), "-o", str(out_png), "-b", "white",
+            [mmdc, "-i", str(src), "-o", str(out_png), "-b", "white",
              "-w", str(MAX_DIAGRAM_W_PX), "-s", "2"],
-            check=True, capture_output=True,
+            check=True, capture_output=True, shell=False,
         )
         return out_png.exists()
-    except subprocess.CalledProcessError as e:
-        print(f"  mmdc failed: {e.stderr.decode(errors='ignore')[:200]}")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        msg = getattr(e, "stderr", b"")
+        if msg:
+            print(f"  mmdc failed: {msg.decode(errors='ignore')[:200]}")
+        else:
+            print(f"  mmdc failed: {e}")
         return False
     finally:
         src.unlink(missing_ok=True)
 
 
 def render_mermaid(code: str, out_png: Path) -> bool:
-    """Render with mermaid.ink first; fall back to local mmdc if installed."""
     if _render_via_mermaid_ink(code, out_png):
         return True
-    print("  → falling back to local mmdc (Node.js mermaid-cli)…")
+    print("  -> falling back to local mmdc (Node.js mermaid-cli)...")
     return _render_via_mmdc(code, out_png)
 
 
 # ---------- A4 fit validation -------------------------------------------
 
 def fit_to_a4(png: Path) -> tuple[int, int]:
-    """Resize PNG so it never exceeds the A4 content area. Returns final WxH px."""
     with Image.open(png) as im:
         im = im.convert("RGBA")
         w, h = im.size
@@ -144,7 +142,6 @@ def fit_to_a4(png: Path) -> tuple[int, int]:
             new = (max(1, int(w * scale)), max(1, int(h * scale)))
             im = im.resize(new, Image.LANCZOS)
             w, h = new
-        # Pad a 1px transparent border so PDF engines don't crop edges.
         im.save(png, "PNG", optimize=True)
         return w, h
 
@@ -152,10 +149,12 @@ def fit_to_a4(png: Path) -> tuple[int, int]:
 # ---------- Markdown pre-processing -------------------------------------
 
 def extract_caption_after(md: str, span_end: int) -> str:
-    """Look one line below the closing fence for a `*Figure N — ...*` caption."""
     tail = md[span_end:span_end + 400]
     m = re.match(r"\s*\*Figure[^\n]*\*", tail)
-    return m.group(0).strip("*").strip() if m else ""
+    if not m:
+        return ""
+    # Strip whitespace first, then asterisks, then any leftover whitespace.
+    return m.group(0).strip().strip("*").strip()
 
 
 def preprocess(md_text: str, diagrams_dir: Path) -> tuple[str, list[Diagram]]:
@@ -165,7 +164,6 @@ def preprocess(md_text: str, diagrams_dir: Path) -> tuple[str, list[Diagram]]:
     def replace(match: re.Match) -> str:
         code = match.group(1).strip()
         idx = len(diagrams) + 1
-        # Stable filename keyed on content so re-runs are cache-friendly.
         digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:10]
         png = diagrams_dir / f"diagram_{idx:02d}_{digest}.png"
 
@@ -175,13 +173,12 @@ def preprocess(md_text: str, diagrams_dir: Path) -> tuple[str, list[Diagram]]:
         if not png.exists():
             ok = render_mermaid(code, png)
             if not ok:
-                print(f"  ⚠ failed to render diagram {idx}; embedding raw code block instead.")
-                return match.group(0)  # leave the fenced mermaid block as-is
+                print(f"  ! failed to render diagram {idx}; embedding raw code block instead.")
+                return match.group(0)
         w, h = fit_to_a4(png)
         print(f"  rendered {png.name} ({w}x{h}px)")
 
         diagrams.append(Diagram(idx, code, caption, png))
-        # Use forward-slash relative path so pandoc + weasyprint both find it.
         rel = png.relative_to(diagrams_dir.parent).as_posix()
         return f"![{caption or f'Diagram {idx}'}]({rel})"
 
@@ -189,45 +186,403 @@ def preprocess(md_text: str, diagrams_dir: Path) -> tuple[str, list[Diagram]]:
     return new_md, diagrams
 
 
-# ---------- HTML / PDF --------------------------------------------------
+# ---------- Cover & TOC parsing -----------------------------------------
+
+@dataclass
+class CoverInfo:
+    title: str
+    subtitle: str   # bold blue tagline
+    italic_lines: list[str]
+    info_lines: list[tuple[str, str]]  # (label, value)
+
+
+def parse_cover(md_text: str) -> tuple[CoverInfo, str]:
+    """Pull the first H1 + its blockquote into a cover-info struct.
+    Returns (cover, remaining_md_with_those_chunks_removed).
+    """
+    lines = md_text.splitlines()
+    out: list[str] = []
+    title = ""
+    subtitle = ""
+    italic_lines: list[str] = []
+    info_lines: list[tuple[str, str]] = []
+
+    i = 0
+    n = len(lines)
+    consumed_intro = False
+
+    while i < n:
+        line = lines[i]
+        if not consumed_intro and not title and line.lstrip().startswith("# ") and not line.lstrip().startswith("## "):
+            title = line.lstrip()[2:].strip()
+            # strip trailing " — Technical Documentation" decoration
+            title = re.sub(r"\s*[—-]\s*Technical Documentation\s*$", "", title)
+            i += 1
+            # Eat blank lines
+            while i < n and lines[i].strip() == "":
+                i += 1
+            # Read blockquote block
+            bq: list[str] = []
+            while i < n and lines[i].lstrip().startswith(">"):
+                bq.append(lines[i].lstrip()[1:].strip())
+                i += 1
+            # First non-empty bq line = subtitle; rest = italic / info
+            for raw in bq:
+                if not raw:
+                    continue
+                if not subtitle:
+                    subtitle = raw
+                    continue
+                m = re.match(r"\*\*([^*]+?)\*\*\s*[:：]?\s*(.+)", raw)
+                if m:
+                    label = m.group(1).rstrip(":：").strip()
+                    info_lines.append((label, m.group(2).strip()))
+                else:
+                    italic_lines.append(raw)
+            consumed_intro = True
+            continue
+        out.append(line)
+        i += 1
+
+    return (
+        CoverInfo(title=title or "Document",
+                  subtitle=subtitle,
+                  italic_lines=italic_lines,
+                  info_lines=info_lines),
+        "\n".join(out),
+    )
+
+
+_HEADING_RE = re.compile(r"^(#{2,3})\s+(.+?)\s*$")
+
+
+def slugify(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    return re.sub(r"[\s_-]+", "-", text) or "section"
+
+
+def build_toc_html(md_text: str) -> str:
+    """Build a clean, single-page TOC.
+
+    Strategy that matches the reference layout:
+      - Always include level-2 ("##") headings as numbered entries.
+      - Include level-3 ("###") children ONLY when their parent level-2
+        title contains the words "Core Flows" (those flow names are useful
+        navigation aids; everything else would just bloat the TOC).
+      - Skip the original document's "## Table of Contents" block.
+    """
+    items: list[tuple[int, str, str, str]] = []  # (level, parent_title, text, slug)
+    in_fence = False
+    current_l2 = ""
+    for line in md_text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _HEADING_RE.match(line)
+        if not m:
+            continue
+        level = len(m.group(1))
+        text = m.group(2).strip()
+        if text.lower().startswith("table of contents"):
+            continue
+        if level == 2:
+            current_l2 = text
+            items.append((2, "", text, slugify(text)))
+        elif level == 3:
+            if "core flows" in current_l2.lower():
+                items.append((3, current_l2, text, slugify(text)))
+
+    if not items:
+        return ""
+
+    rows: list[str] = []
+    rows.append('<div class="toc-wrap">')
+    rows.append('<h1 class="toc-h1">Table of Contents</h1>')
+    rows.append('<table class="toc-table" cellpadding="0" cellspacing="0">')
+    for level, _parent, text, _slug in items:
+        cls = "toc-l2" if level == 2 else "toc-l3"
+        rows.append(
+            f'<tr><td class="{cls}">{text}</td></tr>'
+        )
+    rows.append('</table></div>')
+    return "\n".join(rows)
+
+
+def strip_inline_toc_block(md_text: str) -> str:
+    """Remove the original '## Table of Contents' + its numbered list so we
+    can replace it with the auto-generated, styled TOC page."""
+    lines = md_text.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if lines[i].strip().lower().startswith("## table of contents"):
+            # Skip until the next ## heading or "---" rule
+            i += 1
+            while i < n:
+                l = lines[i].lstrip()
+                if l.startswith("## ") or l.startswith("---"):
+                    break
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+# ---------- HTML / CSS --------------------------------------------------
 
 CSS_A4 = """
 @page {
   size: a4 portrait;
-  margin: 20mm 18mm 22mm 18mm;
-  @frame footer { -pdf-frame-content: footerContent; bottom: 8mm; left: 18mm; right: 18mm; height: 8mm; }
+  margin: 18mm 16mm 20mm 16mm;
+  @frame footer {
+    -pdf-frame-content: footerContent;
+    bottom: 8mm; left: 16mm; right: 16mm; height: 8mm;
+  }
+}
+@page cover {
+  size: a4 portrait;
+  margin: 0;
 }
 html { font-size: 10pt; }
-body { font-family: Helvetica, Arial, sans-serif; color: #1a1a1a; line-height: 1.45; }
-h1 { font-size: 22pt; border-bottom: 2px solid #222; padding-bottom: 4pt; -pdf-keep-with-next: true; }
-h2 { font-size: 16pt; margin-top: 18pt; color: #1a3052; border-bottom: 1px solid #ccc; padding-bottom: 2pt; -pdf-keep-with-next: true; }
-h3 { font-size: 13pt; margin-top: 14pt; color: #244062; -pdf-keep-with-next: true; }
-h4 { font-size: 11.5pt; margin-top: 12pt; color: #355881; }
-p, li { orphans: 3; widows: 3; }
-img { max-width: 170mm; margin: 8pt auto; }
-.figure { text-align: center; margin: 8pt 0; -pdf-keep-in-frame-mode: shrink; }
-table { border-collapse: collapse; width: 100%; margin: 8pt 0; font-size: 8.5pt; table-layout: fixed; word-wrap: break-word; -pdf-word-wrap: CJK; }
-table, th, td { border: 0.5pt solid #999; }
-th, td { padding: 3pt 5pt; vertical-align: top; text-align: left; word-wrap: break-word; overflow-wrap: anywhere; -pdf-word-wrap: CJK; }
-th { background-color: #eef1f5; font-weight: bold; }
-td code, th code { font-size: 7.5pt; word-wrap: break-word; overflow-wrap: anywhere; -pdf-word-wrap: CJK; white-space: normal; }
-code { font-family: Courier, monospace; background-color: #f3f3f3; padding: 1pt 3pt; font-size: 9pt; }
-pre { background-color: #f7f7f9; border: 0.5pt solid #ddd; padding: 6pt 8pt; font-size: 8.5pt; font-family: Courier, monospace; -pdf-keep-in-frame-mode: shrink; white-space: pre-wrap; word-wrap: break-word; }
-pre code { background-color: transparent; padding: 0; }
-blockquote { border-left: 3pt solid #b6c4d2; margin: 6pt 0; padding: 4pt 8pt; color: #444; background-color: #f6f9fc; }
-em { color: #555; font-style: italic; }
-hr { border: 0; border-top: 0.5pt solid #ccc; margin: 12pt 0; }
-.toc a { text-decoration: none; color: #0b5fff; }
+body { font-family: Helvetica, Arial, sans-serif; color: #2c3540; line-height: 1.45; }
+
+/* ---------- COVER ---------- */
+.cover-wrap {
+  page-break-after: always;
+  text-align: center;
+}
+.cover-table {
+  width: 100%;
+  border: 0;
+  border-collapse: collapse;
+}
+.cover-table td {
+  border: 0;
+  text-align: center;
+  padding: 1.5pt 0;
+}
+.cover-spacer-top { height: 60mm; line-height: 60mm; }
+.cover-spacer-md  { height: 12mm; line-height: 12mm; }
+.cover-title    { font-size: 26pt; color: #1a3a5c; line-height: 1.25; }
+.cover-subtitle { font-size: 14pt; color: #3a72c7; padding-top: 4mm !important; }
+.cover-italic-line { font-size: 10.5pt; color: #7f8a98; line-height: 1.6; }
+.cover-info-line   { font-size: 10.5pt; color: #2c3540; line-height: 1.9; }
+
+/* ---------- TOC ---------- */
+.toc-wrap {
+  padding: 4mm 2mm 0 2mm;
+  page-break-after: always;
+}
+.toc-h1 {
+  font-size: 26pt;
+  color: #1a3a5c;
+  border-bottom: 2.4pt solid #1a3a5c;
+  padding-bottom: 6pt;
+  margin: 0 0 9mm 0;
+  font-weight: bold;
+}
+.toc-table {
+  width: 100%;
+  border: 0;
+  border-collapse: collapse;
+  font-size: 10.5pt;
+}
+.toc-table td {
+  border: 0;
+  padding: 2.5pt 0;
+  text-align: left;
+}
+.toc-l2 { color: #2c3540; }
+.toc-l3 {
+  color: #5a6470;
+  font-size: 10pt;
+  padding-left: 11mm !important;
+}
+.toc-table a { color: inherit; text-decoration: none; }
+
+/* ---------- BODY HEADINGS ---------- */
+h1 {
+  font-size: 22pt;
+  color: #1a3a5c;
+  border-bottom: 2pt solid #1a3a5c;
+  padding-bottom: 4pt;
+  -pdf-keep-with-next: true;
+}
+h2 {
+  font-size: 17pt;
+  color: #1a3a5c;
+  border-bottom: 1.2pt solid #1a3a5c;
+  padding-bottom: 4pt;
+  margin: 6mm 0 4mm 0;
+  font-weight: bold;
+  -pdf-keep-with-next: true;
+}
+h3 {
+  font-size: 12.5pt;
+  color: #1a3a5c;
+  border-left: 3pt solid #3a72c7;
+  padding-left: 6pt;
+  margin: 5mm 0 2mm 0;
+  font-weight: bold;
+  -pdf-keep-with-next: true;
+}
+h4 {
+  font-size: 10.5pt;
+  color: #244062;
+  margin: 3mm 0 1mm 0;
+  -pdf-keep-with-next: true;
+}
+
+/* ---------- PARAGRAPHS / LISTS ---------- */
+p { margin: 0 0 5pt 0; orphans: 3; widows: 3; }
+ul, ol { margin: 3pt 0 6pt 6mm; padding: 0; }
+li { margin: 2pt 0; page-break-inside: avoid; }
+
+/* ---------- FIGURES (DIAGRAM + CAPTION) ---------- */
+table.figure {
+  width: 100%;
+  border: 0;
+  border-collapse: collapse;
+  margin: 2mm 0 3mm 0;
+  page-break-inside: avoid;
+}
+table.figure td {
+  border: 0;
+  padding: 0;
+  text-align: center;
+}
+table.figure td.figure-img img { max-width: 168mm; }
+table.figure td.figure-caption {
+  font-size: 9pt;
+  color: #7f8a98;
+  padding-top: 3pt;
+  font-style: italic;
+}
+
+/* ---------- TABLES ---------- */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 6pt 0 10pt 0;
+  font-size: 9.5pt;
+  table-layout: fixed;
+  word-wrap: break-word;
+  -pdf-word-wrap: CJK;
+  page-break-inside: auto;
+}
+table, th, td { border: 0.4pt solid #d8dde3; }
+th, td {
+  padding: 5pt 7pt;
+  vertical-align: top;
+  text-align: left;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  -pdf-word-wrap: CJK;
+}
+th {
+  background-color: #eef3f9;
+  color: #1a3a5c;
+  font-weight: bold;
+  border-bottom: 1pt solid #1a3a5c;
+}
+tr { page-break-inside: avoid; }
+tr:nth-child(even) td { background-color: #fafbfc; }
+
+td code, th code {
+  font-size: 8.5pt;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  -pdf-word-wrap: CJK;
+  white-space: normal;
+}
+
+/* ---------- INLINE CODE (pink/red on soft red) ---------- */
+code {
+  font-family: "Courier New", Courier, monospace;
+  background-color: #fde8e8;
+  color: #c0392b;
+  padding: 1pt 4pt;
+  font-size: 9pt;
+  border-radius: 2pt;
+}
+
+/* ---------- CODE BLOCKS (light theme — reliable in xhtml2pdf) ---------- */
+pre {
+  background-color: #f4f6fa;
+  color: #1f2a44;
+  border: 0.4pt solid #d8dde3;
+  border-left: 3pt solid #3a72c7;
+  padding: 8pt 11pt;
+  font-size: 8.5pt;
+  font-family: "Courier New", Courier, monospace;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  page-break-inside: avoid;
+  margin: 4pt 0 8pt 0;
+}
+pre, pre * {
+  background-color: #f4f6fa !important;
+  color: #1f2a44 !important;
+}
+pre code, pre code * {
+  background-color: transparent !important;
+  color: #1f2a44 !important;
+  padding: 0 !important;
+  font-size: 8.5pt !important;
+}
+
+blockquote {
+  border-left: 3pt solid #facc15;
+  margin: 6pt 0;
+  padding: 4pt 9pt;
+  color: #4b5563;
+  background-color: #fffbeb;
+  font-size: 9.5pt;
+  page-break-inside: avoid;
+}
+
+em { color: #5a6470; font-style: italic; }
+strong { color: #1a3a5c; }
+hr { border: 0; border-top: 0.5pt solid #d8dde3; margin: 10pt 0; }
 """
 
 FOOTER_HTML = """
-<div id="footerContent" style="font-size:8pt;color:#666;text-align:right;">
+<div id="footerContent" style="font-size:8.5pt;color:#6b7280;text-align:right;font-family:Helvetica,Arial,sans-serif;">
+  <span style="float:left;color:#9ca3af;">{title_short}</span>
   Page <pdf:pagenumber/> of <pdf:pagecount/>
 </div>"""
 
 HTML_SHELL = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>{title}</title>
-<style>{css}</style></head><body>{footer}{body}</body></html>"""
+<style>{css}</style></head><body>{footer}{cover}{toc}{body}</body></html>"""
+
+
+_PRE_CODE_RE = re.compile(
+    r'(<pre><code[^>]*>)([\s\S]*?)(</code></pre>)', re.IGNORECASE
+)
+
+
+def _preserve_code_newlines(html: str) -> str:
+    """xhtml2pdf collapses newlines inside <pre><code>...</code></pre> into
+    single spaces. Replace each newline with an explicit <br/> so each
+    code line lands on its own row in the rendered PDF."""
+    def repl(m: re.Match) -> str:
+        opener, body, closer = m.group(1), m.group(2), m.group(3)
+        # Preserve indentation: convert leading spaces on each line to &nbsp;.
+        lines = body.split("\n")
+        out: list[str] = []
+        for line in lines:
+            # Count leading spaces
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            out.append("&nbsp;" * indent + stripped)
+        return opener + "<br/>".join(out) + closer
+    return _PRE_CODE_RE.sub(repl, html)
 
 
 _TABLE_RE = re.compile(r"<table[\s\S]*?</table>", re.IGNORECASE)
@@ -239,7 +594,6 @@ _BREAK_AFTER = set("/._-:?&=,")
 
 
 def _segment_long_token(token: str, every: int = 14) -> list[str]:
-    """Split a long token into wrap-friendly segments at URL-like separators."""
     if len(token) <= every:
         return [token]
     parts: list[str] = []
@@ -258,13 +612,6 @@ def _segment_long_token(token: str, every: int = 14) -> list[str]:
 
 
 def _wrap_code_for_table(text: str) -> str:
-    """Render an inline-code body with safe break points for narrow A4 columns.
-
-    We emit each segment inside its own <code> element separated by zero-width <wbr/>
-    look-alikes (an empty <span> with no width). Using separate <code> elements
-    lets xhtml2pdf treat segment boundaries as wrap points without putting any
-    visible glyph in the output.
-    """
     segments = _segment_long_token(text)
     if len(segments) == 1:
         return f"<code>{segments[0]}</code>"
@@ -272,7 +619,6 @@ def _wrap_code_for_table(text: str) -> str:
 
 
 def _make_table_cells_wrappable(html: str) -> str:
-    """Inside <td>/<th>, segment long <code> bodies so they wrap on narrow A4 columns."""
     def fix_cell(m: re.Match) -> str:
         open_tag, body, close_tag = m.group(1), m.group(2), m.group(3)
 
@@ -291,30 +637,132 @@ def _make_table_cells_wrappable(html: str) -> str:
     return _TABLE_RE.sub(fix_table, html)
 
 
+# ---------- Wrap each diagram + its caption into one keep-together block ---
+
+# Markdown collapses `image\n*caption*` into a single paragraph. Match the
+# common forms: image + em in the same <p> (with or without <br/>), or split
+# across two <p> tags.
+_FIG_SAMEP_RE = re.compile(
+    r'<p>\s*(<img[^>]+/?>)\s*(?:<br\s*/?>\s*)?\s*<em>\s*(Figure[^<]+?)\s*</em>\s*</p>',
+    re.IGNORECASE,
+)
+_FIG_PARA_RE = re.compile(
+    r'<p>\s*(<img[^>]+/?>)\s*</p>\s*<p>\s*<em>\s*(Figure[^<]+?)\s*</em>\s*</p>',
+    re.IGNORECASE,
+)
+
+
+def _wrap_figures(html: str) -> str:
+    def repl(m: re.Match) -> str:
+        img, cap = m.group(1), m.group(2).strip().rstrip(".")
+        # Use a single-cell table so xhtml2pdf treats image + caption as
+        # one keep-together block and the caption sits centred under the
+        # image instead of running inline beside it.
+        return (
+            '<table class="figure" cellpadding="0" cellspacing="0">'
+            f'<tr><td class="figure-img">{img}</td></tr>'
+            f'<tr><td class="figure-caption"><i>{cap}.</i></td></tr>'
+            '</table>'
+        )
+
+    html = _FIG_PARA_RE.sub(repl, html)
+    html = _FIG_SAMEP_RE.sub(repl, html)
+    return html
+
+
+# ---------- Anchor injection so TOC links land on headings ---------------
+_HEADING_TAG_RE = re.compile(r'<(h[23])>([^<]+)</\1>', re.IGNORECASE)
+
+
+def _inject_heading_anchors(html: str) -> str:
+    def repl(m: re.Match) -> str:
+        tag, text = m.group(1).lower(), m.group(2)
+        slug = slugify(re.sub(r"<[^>]+>", "", text))
+        return f'<{tag} id="{slug}">{text}</{tag}>'
+    return _HEADING_TAG_RE.sub(repl, html)
+
+
+# ---------- Cover HTML ---------------------------------------------------
+
+def render_cover(cover: CoverInfo) -> str:
+    """Render cover as a table with one <tr> per line (xhtml2pdf collapses
+    nested <br/> tags inside table cells, so we explode each line)."""
+    rows: list[str] = []
+
+    rows.append(
+        '<tr><td class="cover-spacer-top">&nbsp;</td></tr>'
+    )
+    rows.append(
+        f'<tr><td class="cover-title"><b>{cover.title}</b></td></tr>'
+    )
+    if cover.subtitle:
+        rows.append(
+            f'<tr><td class="cover-subtitle">{cover.subtitle}</td></tr>'
+        )
+    rows.append('<tr><td class="cover-spacer-md">&nbsp;</td></tr>')
+    for ln in cover.italic_lines:
+        rows.append(f'<tr><td class="cover-italic-line"><i>{ln}</i></td></tr>')
+    rows.append('<tr><td class="cover-spacer-md">&nbsp;</td></tr>')
+    for lbl, val in cover.info_lines:
+        rows.append(
+            '<tr><td class="cover-info-line">'
+            f'<b>{lbl}:</b> {val}'
+            '</td></tr>'
+        )
+
+    body = "\n".join(rows)
+    return (
+        '<div class="cover-wrap">'
+        '<table class="cover-table" cellpadding="0" cellspacing="0">'
+        f'{body}'
+        '</table>'
+        '</div>'
+    )
+
+
+# ---------- Markdown -> HTML pipeline -----------------------------------
+
 def md_to_html(md_text: str, base_dir: Path, title: str) -> str:
+    cover, body_md = parse_cover(md_text)
+    body_md = strip_inline_toc_block(body_md)
+    toc_html = build_toc_html(body_md)
+
     import markdown
+    # Note: we deliberately omit pymdownx.superfences here. Superfences
+    # injects Pygments syntax-highlighting <span> classes whose default
+    # palette renders as near-white text on our dark <pre> background.
+    # Plain fenced_code keeps the code as <pre><code>...</code></pre>
+    # so our CSS controls the entire colour scheme.
     html_body = markdown.markdown(
-        md_text,
+        body_md,
         extensions=[
             "extra", "tables", "fenced_code", "sane_lists", "toc",
-            "pymdownx.superfences", "pymdownx.tilde", "pymdownx.tasklist",
-            "pymdownx.magiclink",
+            "pymdownx.tilde", "pymdownx.tasklist", "pymdownx.magiclink",
         ],
         extension_configs={
             "pymdownx.tasklist": {"custom_checkbox": True},
             "toc": {"permalink": False},
         },
     )
+    html_body = _preserve_code_newlines(html_body)
     html_body = _make_table_cells_wrappable(html_body)
-    return HTML_SHELL.format(title=title, css=CSS_A4, footer=FOOTER_HTML, body=html_body)
+    html_body = _wrap_figures(html_body)
+    html_body = _inject_heading_anchors(html_body)
+
+    return HTML_SHELL.format(
+        title=title,
+        css=CSS_A4,
+        footer=FOOTER_HTML.format(title_short=cover.title or title),
+        cover=render_cover(cover),
+        toc=toc_html,
+        body=html_body,
+    )
 
 
 def html_to_pdf(html: str, base_dir: Path, out_pdf: Path) -> None:
-    """Render HTML to A4 PDF using xhtml2pdf (pure Python, no system libs)."""
     from xhtml2pdf import pisa
 
     def link_callback(uri: str, rel: str) -> str:
-        # Resolve relative image paths against base_dir.
         if uri.startswith(("http://", "https://", "data:")):
             return uri
         candidate = (base_dir / uri).resolve()
@@ -329,7 +777,6 @@ def html_to_pdf(html: str, base_dir: Path, out_pdf: Path) -> None:
 # ---------- DOCX --------------------------------------------------------
 
 def md_to_docx(md_path: Path, out_docx: Path) -> None:
-    """Use bundled pandoc (pypandoc-binary) for a clean DOCX with images/tables."""
     import pypandoc
     extra = [
         "--standalone",
@@ -364,7 +811,7 @@ def validate(diagrams: list[Diagram]) -> None:
 # ---------- Main --------------------------------------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Markdown → PDF + DOCX with rendered Mermaid (A4-safe).")
+    ap = argparse.ArgumentParser(description="Markdown -> PDF + DOCX with rendered Mermaid (A4-safe).")
     ap.add_argument("input", type=Path, help="Path to the source .md file.")
     ap.add_argument("--out", type=Path, default=None, help="Output directory (default: <input>_build).")
     ap.add_argument("--pdf-only", action="store_true")
@@ -379,15 +826,15 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     diagrams_dir = out_dir / "diagrams"
 
-    print(f"→ reading   {args.input}")
+    print(f"-> reading   {args.input}")
     md_text = args.input.read_text(encoding="utf-8")
 
-    print(f"→ rendering mermaid → PNG into {diagrams_dir}")
+    print(f"-> rendering mermaid -> PNG into {diagrams_dir}")
     processed_md, diagrams = preprocess(md_text, diagrams_dir)
 
     processed_md_path = out_dir / (args.input.stem + ".processed.md")
     processed_md_path.write_text(processed_md, encoding="utf-8")
-    print(f"→ wrote     {processed_md_path}")
+    print(f"-> wrote     {processed_md_path}")
 
     validate(diagrams)
 
@@ -397,16 +844,16 @@ def main() -> int:
     docx_path = out_dir / (args.input.stem + ".docx")
 
     if not args.docx_only:
-        print("→ building PDF (xhtml2pdf, A4) …")
+        print("-> building PDF (xhtml2pdf, A4) ...")
         html = md_to_html(processed_md, base_dir=out_dir, title=title)
         (out_dir / (args.input.stem + ".preview.html")).write_text(html, encoding="utf-8")
         html_to_pdf(html, out_dir, pdf_path)
-        print(f"   ✓ {pdf_path}")
+        print(f"   OK {pdf_path}")
 
     if not args.pdf_only:
-        print("→ building DOCX (pandoc) …")
+        print("-> building DOCX (pandoc) ...")
         md_to_docx(processed_md_path, docx_path)
-        print(f"   ✓ {docx_path}")
+        print(f"   OK {docx_path}")
 
     print("\nDone.")
     return 0
