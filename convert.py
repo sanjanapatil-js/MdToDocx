@@ -9,6 +9,7 @@
 #   "Pillow>=10.2",
 #   "xhtml2pdf>=0.2.15",
 #   "pypandoc-binary>=1.13",
+#   "python-docx>=1.1",
 # ]
 # ///
 """
@@ -776,21 +777,238 @@ def html_to_pdf(html: str, base_dir: Path, out_pdf: Path) -> None:
 
 # ---------- DOCX --------------------------------------------------------
 
+# Pandoc uses the styles from a reference DOCX as the base for every paragraph,
+# heading, table, and code block. We build one programmatically so the Word
+# document mirrors the PDF (same navy palette, blue-bar h3, light-blue table
+# headers, light-grey code, centered figures, pink inline code).
+
+_REF_RGB_NAVY      = (26, 58, 92)     # #1A3A5C — h1/h2/h3 colour
+_REF_RGB_BLUE      = (58, 114, 199)   # #3A72C7 — subtitle / accent
+_REF_RGB_BODY      = (44, 53, 64)     # #2C3540 — body text
+_REF_RGB_GREY      = (127, 138, 152)  # #7F8A98 — captions, italic intro
+_REF_RGB_PINK_BG   = (253, 232, 232)  # #FDE8E8 — inline code bg
+_REF_RGB_PINK_FG   = (192, 57, 43)    # #C0392B — inline code text
+_REF_RGB_CODE_BG   = (244, 246, 250)  # #F4F6FA — code block bg
+_REF_RGB_TBLHEAD   = (238, 243, 249)  # #EEF3F9 — table header bg
+_REF_RGB_BORDER    = (216, 221, 227)  # #D8DDE3 — table borders
+
+
+def _build_reference_docx(out_path: Path) -> None:
+    """Create a reference.docx whose styles match the PDF's palette.
+
+    Pandoc 3.x writes DOCX with these style ids (no spaces): Heading1, Heading2,
+    Heading3, SourceCode (paragraph), VerbatimChar (run), ImageCaption,
+    CaptionedFigure, FirstParagraph, BodyText, Compact, Title, Subtitle.
+    We define / override those exact ids so pandoc's pStyle / rStyle references
+    bind to our styling.
+    """
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    doc = Document()
+
+    # Page setup: A4, narrow margins.
+    for section in doc.sections:
+        section.page_height = Cm(29.7)
+        section.page_width  = Cm(21.0)
+        section.top_margin  = Cm(2.0)
+        section.bottom_margin = Cm(2.2)
+        section.left_margin = Cm(1.8)
+        section.right_margin = Cm(1.8)
+
+    def get_or_add_style(name: str, kind: int):
+        try:
+            return doc.styles[name]
+        except KeyError:
+            return doc.styles.add_style(name, kind)
+
+    def set_font(s, *, size=None, color=None, bold=None, italic=None, name=None):
+        if s is None: return
+        f = s.font
+        if name is not None: f.name = name
+        if size is not None: f.size = Pt(size)
+        if color is not None: f.color.rgb = RGBColor(*color)
+        if bold is not None: f.bold = bold
+        if italic is not None: f.italic = italic
+
+    def add_pPr_border(s, side, sz_8ths_pt, color_hex, space="1"):
+        pPr = s.element.get_or_add_pPr()
+        pBdr = pPr.find(qn("w:pBdr"))
+        if pBdr is None:
+            pBdr = OxmlElement("w:pBdr")
+            pPr.append(pBdr)
+        elem = OxmlElement(f"w:{side}")
+        elem.set(qn("w:val"), "single")
+        elem.set(qn("w:sz"), str(sz_8ths_pt))
+        elem.set(qn("w:space"), space)
+        elem.set(qn("w:color"), color_hex)
+        pBdr.append(elem)
+
+    def set_pPr_shading(s, fill_hex):
+        pPr = s.element.get_or_add_pPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), fill_hex)
+        pPr.append(shd)
+
+    def set_rPr_shading(s, fill_hex):
+        rpr = s.element.get_or_add_rPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), fill_hex)
+        rpr.append(shd)
+
+    # ---- Body / Normal.
+    s = doc.styles["Normal"]
+    set_font(s, name="Helvetica", size=10, color=_REF_RGB_BODY)
+    s.paragraph_format.space_after = Pt(4)
+
+    # ---- Title (cover H1).
+    s = get_or_add_style("Title", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=26, color=_REF_RGB_NAVY, bold=True)
+    s.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    s.paragraph_format.space_after = Pt(4)
+
+    # ---- Subtitle (cover tagline).
+    s = get_or_add_style("Subtitle", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=14, color=_REF_RGB_BLUE)
+    s.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    s.paragraph_format.space_after = Pt(10)
+
+    # ---- Heading1 (markdown `#` — only the cover doc title in our case).
+    s = get_or_add_style("Heading1", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=22, color=_REF_RGB_NAVY, bold=True)
+    s.paragraph_format.space_before = Pt(0)
+    s.paragraph_format.space_after = Pt(6)
+    add_pPr_border(s, "bottom", 16, "1A3A5C", space="1")
+
+    # ---- Heading2 (markdown `##` — section headings).
+    s = get_or_add_style("Heading2", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=17, color=_REF_RGB_NAVY, bold=True)
+    s.paragraph_format.space_before = Pt(14)
+    s.paragraph_format.space_after = Pt(4)
+    s.paragraph_format.keep_with_next = True
+    add_pPr_border(s, "bottom", 12, "1A3A5C", space="1")
+
+    # ---- Heading3 (markdown `###` — subsection with blue left bar).
+    s = get_or_add_style("Heading3", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=12, color=_REF_RGB_NAVY, bold=True)
+    s.paragraph_format.space_before = Pt(10)
+    s.paragraph_format.space_after = Pt(3)
+    s.paragraph_format.left_indent = Cm(0.25)
+    s.paragraph_format.keep_with_next = True
+    add_pPr_border(s, "left", 24, "3A72C7", space="6")
+
+    # ---- VerbatimChar (inline code — pink fg on soft pink bg).
+    s = get_or_add_style("VerbatimChar", WD_STYLE_TYPE.CHARACTER)
+    set_font(s, name="Courier New", size=9, color=_REF_RGB_PINK_FG)
+    set_rPr_shading(s, "FDE8E8")
+
+    # ---- SourceCode (block code — light grey bg, blue left bar).
+    s = get_or_add_style("SourceCode", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Courier New", size=8.5, color=_REF_RGB_BODY)
+    s.paragraph_format.space_before = Pt(4)
+    s.paragraph_format.space_after = Pt(8)
+    s.paragraph_format.left_indent = Cm(0.3)
+    set_pPr_shading(s, "F4F6FA")
+    add_pPr_border(s, "left", 24, "3A72C7", space="6")
+
+    # ---- ImageCaption (centered italic grey).
+    s = get_or_add_style("ImageCaption", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=9, color=_REF_RGB_GREY, italic=True)
+    s.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    s.paragraph_format.space_before = Pt(2)
+    s.paragraph_format.space_after = Pt(8)
+
+    # ---- CaptionedFigure (the image's containing paragraph — center it).
+    s = get_or_add_style("CaptionedFigure", WD_STYLE_TYPE.PARAGRAPH)
+    s.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    s.paragraph_format.space_before = Pt(6)
+    s.paragraph_format.space_after = Pt(2)
+
+    # ---- FirstParagraph (paragraph after a heading).
+    s = get_or_add_style("FirstParagraph", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=10, color=_REF_RGB_BODY)
+    s.paragraph_format.space_after = Pt(4)
+
+    # ---- BodyText.
+    s = get_or_add_style("BodyText", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=10, color=_REF_RGB_BODY)
+
+    # ---- Compact (pandoc tight-list paragraphs).
+    s = get_or_add_style("Compact", WD_STYLE_TYPE.PARAGRAPH)
+    set_font(s, name="Helvetica", size=10, color=_REF_RGB_BODY)
+    s.paragraph_format.space_after = Pt(2)
+
+    # ---- TableGrid (default for tables) — light blue header.
+    try:
+        tg = doc.styles["Table Grid"]
+        tg.font.name = "Helvetica"
+        tg.font.size = Pt(9.5)
+        tg.font.color.rgb = RGBColor(*_REF_RGB_BODY)
+    except KeyError:
+        pass
+
+    doc.save(str(out_path))
+
+
+# Pandoc inserts a centered Figure caption automatically from the image's alt
+# text via implicit_figures. Our markdown also has a `*Figure N — ...*` italic
+# line right under the image (the PDF reads it via its own caption regex). For
+# the DOCX, that italic line ends up as a *second* caption that pushes the
+# layout around. Strip it before pandoc sees it.
+_DOCX_CAPTION_LINE_RE = re.compile(
+    r'^\s*\*Figure\s+\d+\s+[—-][^\n]*\*\s*$', re.MULTILINE
+)
+
+
+def _strip_caption_lines_for_docx(md_text: str) -> str:
+    return _DOCX_CAPTION_LINE_RE.sub('', md_text)
+
+
 def md_to_docx(md_path: Path, out_docx: Path) -> None:
     import pypandoc
+
+    # Build the reference.docx style template next to the output file.
+    ref_docx = out_docx.with_name("_reference.docx")
+    _build_reference_docx(ref_docx)
+
+    # Build a docx-tuned copy of the markdown (no duplicate Figure captions).
+    docx_md = md_path.with_suffix(".docx.md")
+    docx_md.write_text(
+        _strip_caption_lines_for_docx(md_path.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+
     extra = [
         "--standalone",
         "--toc",
         "--toc-depth=3",
-        "--from=gfm+yaml_metadata_block",
+        "--from=gfm+yaml_metadata_block+implicit_figures",
         "--resource-path=" + str(md_path.parent),
+        "--reference-doc=" + str(ref_docx),
+        # Disable Pandoc's syntax highlighter — its KeywordTok / StringTok
+        # token styles override SourceCode's colour, so all code lines
+        # would otherwise render in a rainbow palette. We want the whole
+        # block in one body colour, matching the PDF.
+        "--no-highlight",
     ]
     pypandoc.convert_file(
-        str(md_path), to="docx",
+        str(docx_md), to="docx",
         outputfile=str(out_docx),
         format="gfm",
         extra_args=extra,
     )
+
+    # Tidy up: remove the temp md / reference once DOCX is built.
+    docx_md.unlink(missing_ok=True)
+    ref_docx.unlink(missing_ok=True)
 
 
 # ---------- Validation report -------------------------------------------
